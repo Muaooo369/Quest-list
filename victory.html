@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FF7 點陣風格戰鬥與結算升級系統</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&family=Noto+Sans+TC:wght@700;900&display=swap" rel="stylesheet" />
+  <style>
+    /* 強制點陣銳利像素渲染 */
+    canvas {
+      image-rendering: -moz-crisp-edges;
+      image-rendering: -webkit-crisp-edges;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      display: block;
+    }
+
+    body {
+      background-color: #090b10;
+      font-family: "DotGothic16", "Noto Sans TC", monospace;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .arcade-bezel {
+      box-shadow: 0 0 0 4px #1e2536, 0 0 0 8px #0f131c, 0 28px 70px rgba(0, 0, 0, 0.9);
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-3 sm:p-5 text-slate-200">
+
+  <!-- 純淨無遮擋的 4:3 HD-2D 高解析點陣遊戲畫面 (640x480 邏輯解析度 -> 960x720 顯示) -->
+  <div class="arcade-bezel rounded overflow-hidden bg-black relative">
+    <canvas id="gameCanvas" width="960" height="720" class="w-[360px] h-[270px] sm:w-[640px] sm:h-[480px] lg:w-[960px] lg:h-[720px] cursor-pointer"></canvas>
+  </div>
+
+  <!-- 戰鬥視窗下方：回到首頁按鈕 (連結至同目錄 index.html) -->
+  <div class="mt-6 flex items-center justify-center">
+    <a href="index.html" class="px-6 py-2.5 rounded bg-gradient-to-b from-blue-800 to-slate-900 hover:from-blue-700 hover:to-slate-800 active:translate-y-0.5 text-amber-300 hover:text-amber-200 border-2 border-slate-300/80 font-bold tracking-widest text-sm sm:text-base transition shadow-lg">
+      ◀ 回到首頁
+    </a>
+  </div>
+
+  <script>
+    /**
+     * ============================================================================
+     * 1. 混合音效引擎：戰鬥維持原樣合成音效，勝利結算播放外部 ff7_victory.mp3
+     * ============================================================================
+     */
+    class HybridSoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.muted = false;
+        this.victoryAllowed = false; // 嚴格鎖定：未打出致命一擊並延遲1秒前，絕對禁止播放
+        this.victoryAudio = null;
+      }
+
+      init() {
+        if (!this.ctx) {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          this.ctx = new AudioCtx();
+        }
+        if (this.ctx.state === "suspended") {
+          this.ctx.resume();
+        }
+      }
+
+      tone(freq, dur, type = "square", delay = 0, vol = 0.08, slide = null) {
+        if (this.muted) return;
+        this.init();
+        const t = this.ctx.currentTime + delay;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, t);
+        if (slide) osc.frequency.exponentialRampToValueAtTime(slide, t + dur);
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(t);
+        osc.stop(t + dur + 0.01);
+      }
+
+      noise(dur, delay = 0, vol = 0.1, freq = 900) {
+        if (this.muted) return;
+        this.init();
+        const t = this.ctx.currentTime + delay;
+        const len = Math.floor(this.ctx.sampleRate * dur);
+        const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.setValueAtTime(freq, t);
+        const gain = this.ctx.createGain();
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        src.connect(filter);
+        filter.connect(gain);
+        gain.connect(this.ctx.destination);
+        src.start(t);
+        src.stop(t + dur);
+      }
+
+      cursor() { this.tone(1046.5, 0.05, "square", 0, 0.05); }
+      confirm() { this.tone(1318.5, 0.08, "square", 0, 0.06); }
+
+      swordSlash() {
+        this.tone(860, 0.13, "sawtooth", 0, 0.09, 130);
+        this.noise(0.12, 0.01, 0.1, 1400);
+      }
+
+      punchCombo() {
+        this.noise(0.07, 0.00, 0.11, 600);
+        this.noise(0.07, 0.08, 0.11, 700);
+        this.tone(150, 0.12, "square", 0.14, 0.11, 55);
+      }
+
+      staffBonk() {
+        this.tone(320, 0.1, "triangle", 0, 0.09, 110);
+      }
+
+      fireball() {
+        this.noise(0.32, 0, 0.13, 420);
+        this.tone(240, 0.3, "sawtooth", 0, 0.08, 65);
+      }
+
+      thunderbolt() {
+        this.noise(0.28, 0, 0.15, 2200);
+        this.tone(1480, 0.08, "square", 0.02, 0.08, 220);
+        this.tone(1180, 0.12, "square", 0.1, 0.08, 160);
+      }
+
+      blizzard() {
+        [1567.98, 1975.53, 2349.32, 1760].forEach((f, i) => {
+          this.tone(f, 0.14, "triangle", i * 0.06, 0.07);
+        });
+        this.noise(0.25, 0.04, 0.08, 3000);
+      }
+
+      limitBreak() {
+        this.tone(440, 0.09, "square", 0.00, 0.08);
+        this.tone(554.37, 0.09, "square", 0.08, 0.08);
+        this.tone(659.25, 0.09, "square", 0.16, 0.08);
+        this.tone(880, 0.24, "sawtooth", 0.24, 0.1);
+      }
+
+      criticalFinish() {
+        this.noise(0.35, 0, 0.18, 800);
+        this.tone(160, 0.24, "square", 0, 0.14, 42);
+        this.tone(1046.5, 0.08, "square", 0.05, 0.09);
+        this.tone(1567.98, 0.2, "square", 0.12, 0.09);
+      }
+
+      dragonDefeat() {
+        this.noise(0.65, 0, 0.15, 350);
+        this.tone(220, 0.6, "sawtooth", 0, 0.1, 32);
+      }
+
+      // 僅在打出 9999! 並等待 1 秒後呼叫一次，建立全新 Audio 實例並持續循環播放
+      startVictoryOnce() {
+        if (this.muted || this.victoryAllowed) return;
+        this.victoryAllowed = true;
+        try {
+          if (this.victoryAudio) {
+            this.victoryAudio.pause();
+            this.victoryAudio = null;
+          }
+          const bgm = new Audio("./ff7_victory.mp3");
+          bgm.loop = true;
+          bgm.volume = 1.0;
+          bgm.addEventListener("ended", () => {
+            if (this.victoryAllowed && !this.muted) {
+              bgm.currentTime = 0;
+              bgm.play().catch(() => {});
+            }
+          });
+          this.victoryAudio = bgm;
+          const p = bgm.play();
+          if (p !== undefined) {
+            p.catch(() => {});
+          }
+        } catch (err) {
+          // 容錯處理
+        }
+      }
+
+      // 停止並銷毀勝利音樂（僅在結算完成返回前一頁或重置時呼叫）
+      stopVictory() {
+        this.victoryAllowed = false;
+        try {
+          if (this.victoryAudio) {
+            this.victoryAudio.pause();
+            this.victoryAudio.currentTime = 0;
+            this.victoryAudio = null;
+          }
+        } catch (err) {
+          // 容錯處理
+        }
+      }
+
+      expTick() { this.tone(1244.5, 0.035, "square", 0, 0.035); }
+
+      levelUp() {
+        [523.25, 659.25, 783.99, 1046.5, 1318.51, 1567.98].forEach((f, i) => {
+          this.tone(f, 0.12, "square", i * 0.06, 0.08);
+        });
+      }
+    }
+
+    const audio = new HybridSoundEngine();
+
+    /**
+     * ============================================================================
+     * 2. HD-2D 高解析點陣精靈繪製系統 (640x480 邏輯解析度)
+     * ============================================================================
+     */
+    const LOGICAL_W = 640;
+    const LOGICAL_H = 480;
+
+    const offCanvas = document.createElement("canvas");
+    offCanvas.width = LOGICAL_W;
+    offCanvas.height = LOGICAL_H;
+    const octx = offCanvas.getContext("2d");
+    octx.imageSmoothingEnabled = false;
+
+    const mainCanvas = document.getElementById("gameCanvas");
+    const mctx = mainCanvas.getContext("2d");
+    mctx.imageSmoothingEnabled = false;
+
+    const PAL = {
+      ".": null,
+      "K": "#090a0f",
+      "W": "#fcfcfc",
+      "g": "#b8c4d0",
+      "G": "#707c8c",
+      "d": "#3c4452",
+      "S": "#f8c088",
+      "s": "#d08850",
+      "Y": "#f8d830",
+      "y": "#c89810",
+      "B": "#1c3868",
+      "b": "#102040",
+      "C": "#3898f8",
+      "c": "#78d8ff",
+      "R": "#e02820",
+      "r": "#881414",
+      "O": "#f87818",
+      "o": "#c84008",
+      "H": "#241818",
+      "h": "#48302c",
+      "M": "#683c18",
+      "m": "#9c6028",
+      "D": "#241428",
+      "P": "#4a1c38",
+      "L": "#ffea68"
+    };
+
+    const CLOUD_IDLE = [
+      ".........YY..YY.........",
+      ".......YYYYYYYYY........",
+      "......YYYYYYYYYYY.......",
+      ".....YYYYYYYYYYYYY......",
+      "......YYSSSSSSSYY.......",
+      "......YSCSSSSCSY........",
+      ".......SSSSSSSS.........",
+      "........SSsSsS..........",
+      "......gGBBBBBBBGg.......",
+      ".....gGGBBBBBBBGGg......",
+      ".....SSBBBBBBBBBbS......",
+      ".....SSBBBBBBBBBbS......",
+      "......KBBBBBBBBBK.......",
+      ".....gGBBBBBBBBBGg......",
+      "....gG..BBBBBBB..Gg.....",
+      "...gG...BBBBBBB...Gg....",
+      "..gG....BBB.BBB....Gg...",
+      ".gG.....BBB.BBB.....Gg..",
+      "........dKd.dKd.........",
+      "........dKd.dKd.........",
+      ".......KdKK.KKdK........",
+      "........................",
+      "........................",
+      "........................"
+    ];
+
+    const CLOUD_WIN = [
+      "...gG................... ",
+      "..gGg.....YY..YY........",
+      ".gGGg...YYYYYYYYY.......",
+      ".gGGg..YYYYYYYYYYY......",
+      ".gGGg.YYYYYYYYYYYYY.....",
+      ".dKd...YYSSSSSSSYY......",
+      ".SS....YSCSSSSCSY.......",
+      ".SS.....SSSSSSSS........",
+      "..BBBBBBBBBBBBBGg.......",
+      "...BBBBBBBBBBBBGGg......",
+      "...BBBBBBBBBBBBbSS......",
+      "....BBBBBBBBBBBbSS......",
+      "....KBBBBBBBBBBK........",
+      ".....BBBBBBBBBB.........",
+      "......BBB..BBB..........",
+      "......BBB..BBB..........",
+      "......BBB..BBB..........",
+      "......dKd..dKd..........",
+      "......dKd..dKd..........",
+      ".....KdKK..KKdK.........",
+      "........................",
+      "........................",
+      "........................",
+      "........................"
+    ].map(r => r.slice(0, 24));
+
+    const TIFA_IDLE = [
+      "........HHHHHHH.........",
+      ".......HHHHHHHHH........",
+      "......HHHHHHHHHHH.......",
+      "......HHSSSSSSSHH.......",
+      "......HHSKSSSKSHH.......",
+      "......HHSSSSSSSHH.......",
+      ".......HSSSSSSSH........",
+      ".......HWWWWWWWH........",
+      ".....RRWWWWWWWWWRR......",
+      "....RRRWWWWWWWWWRRR.....",
+      "....RR.WWWWWWWWW.RR.....",
+      ".......KKKKKKKKK........",
+      ".......KKKKKKKKK........",
+      ".......KKKKKKKKK........",
+      ".......KKK...KKK........",
+      ".......SSS...SSS........",
+      ".......SSS...SSS........",
+      ".......RRR...RRR........",
+      ".......RRR...RRR........",
+      "......KRRK...KRRK.......",
+      "........................",
+      "........................",
+      "........................",
+      "........................"
+    ];
+
+    const TIFA_WIN = [
+      "....RR...........RR.....",
+      "...RRR..HHHHHHH..RRR....",
+      "...SS..HHHHHHHHH..SS....",
+      "...SS.HHHHHHHHHHH.SS....",
+      "....SSHHSSSSSSSHHSS.....",
+      ".....HHHSCSSSCSHHH......",
+      "......HHSSSSSSSHH.......",
+      ".......HWWWWWWWH........",
+      ".......WWWWWWWWW........",
+      ".......WWWWWWWWW........",
+      ".......WWWWWWWWW........",
+      ".......KKKKKKKKK........",
+      ".......KKKKKKKKK........",
+      ".......KKKKKKKKK........",
+      ".......KKK...KKK........",
+      ".......SSS...SSS........",
+      ".......SSS...SSS........",
+      ".......RRR...RRR........",
+      ".......RRR...RRR........",
+      "......KRRK...KRRK.......",
+      "........................",
+      "........................",
+      "........................",
+      "........................"
+    ];
+
+    const BMAGE_IDLE = [
+      "..........YYY...........",
+      ".........YYYYY..........",
+      "........YYYYYYY.........",
+      ".......YYYYYYYYY........",
+      "......YYYYYYYYYYY.......",
+      ".....YYYYYYYYYYYYY......",
+      "....YYYYYYYYYYYYYYY.....",
+      "...YYYYYYYYYYYYYYYYY....",
+      "......KKKKKKKKKKK.......",
+      "......KKYKKKKKYKK.......",
+      "......KKYKKKKKYKK.......",
+      "......KKKKKKKKKKK.......",
+      ".....BBBBBBBBBBBBB......",
+      "...mBBBBBBBBBBBBBBBY....",
+      "...MBBBBBBBBBBBBBBB.....",
+      "...m.BBBBBBBBBBBBB......",
+      "...M.BBBBBBBBBBBBB......",
+      "...m.BBBBBBBBBBBBB......",
+      "...M..BBBBBBBBBBB.......",
+      "...m...KK.....KK........",
+      "......KKKK...KKKK.......",
+      "........................",
+      "........................",
+      "........................"
+    ];
+
+    const BMAGE_WIN = [
+      "..L.......YYY...........",
+      ".LmL.....YYYYY..........",
+      "..M.....YYYYYYY.........",
+      "..m....YYYYYYYYY........",
+      "..M...YYYYYYYYYYY.......",
+      "..m..YYYYYYYYYYYYY..Y...",
+      "..M.YYYYYYYYYYYYYYY.Y...",
+      "..m...KKKKKKKKKKK..Y....",
+      "..M...KKYKKKKKYKK..B....",
+      "..BBBBKKYKKKKKYKKBB.....",
+      "...BBBBKKKKKKKKKBB......",
+      "....BBBBBBBBBBBBB.......",
+      "....BBBBBBBBBBBBB.......",
+      "....BBBBBBBBBBBBB.......",
+      "....BBBBBBBBBBBBB.......",
+      "....BBBBBBBBBBBBB.......",
+      ".....BBBBBBBBBBB........",
+      "......KK.....KK.........",
+      ".....KKKK...KKKK........",
+      "........................",
+      "........................",
+      "........................",
+      "........................",
+      "........................"
+    ];
+
+    function drawSprite(ctx, matrix, x, y, scale = 2, flashWhite = false, dissolveProgress = 0) {
+      const h = matrix.length;
+      const w = matrix[0].length;
+      for (let r = 0; r < h; r++) {
+        for (let c = 0; c < w; c++) {
+          const ch = matrix[r][c];
+          const color = PAL[ch];
+          if (!color) continue;
+
+          if (dissolveProgress > 0) {
+            const hash = ((r * 37 + c * 19) % 100) / 100;
+            if (hash < dissolveProgress) continue;
+          }
+
+          ctx.fillStyle = flashWhite ? "#fcfcfc" : color;
+          ctx.fillRect(Math.floor(x + c * scale), Math.floor(y + r * scale), scale, scale);
+        }
+      }
+    }
+
+    function drawModernFireDragon(ctx, baseX, baseY, tick, flashWhite, dissolveProgress) {
+      const p = 3;
+      const wingFlap = Math.sin(tick * 0.11);
+      const breathe = Math.sin(tick * 0.08);
+      const lavaGlow = Math.floor(tick / 6) % 2 === 0 ? "#ffea68" : "#f87818";
+
+      const px = (gx, gy, w, h, col) => {
+        if (dissolveProgress > 0) {
+          const hash = ((gx * 29 + gy * 43) % 100) / 100;
+          if (hash < dissolveProgress) return;
+        }
+        ctx.fillStyle = flashWhite ? "#fcfcfc" : col;
+        ctx.fillRect(Math.floor(baseX + gx * p), Math.floor(baseY + gy * p), w * p, h * p);
+      };
+
+      const wy = Math.round(wingFlap * 2.5);
+      const by = Math.round(breathe * 1.2);
+
+      // 1. 後翼
+      px(6, 4 + wy, 14, 16, "#241428");
+      px(3, 6 + wy, 12, 14, "#4a1c38");
+      px(1, 9 + wy, 8, 10, "#881414");
+      px(4, 5 + wy, 14, 2, "#090a0f");
+      px(2, 8 + wy, 12, 2, "#881414");
+      px(5, 11 + wy, 10, 1, lavaGlow);
+      px(3, 14 + wy, 11, 1, "#f87818");
+
+      // 2. 燃燒巨尾
+      px(2, 42, 14, 6, "#881414");
+      px(0, 38, 8, 6, "#e02820");
+      px(1, 33, 6, 6, "#f87818");
+      px(2, 29, 4, 5, "#f8d830");
+      px(3, 26, 2, 4, lavaGlow);
+      px(4, 40, 2, 2, "#241428");
+      px(8, 40, 2, 2, "#241428");
+
+      // 3. 龍軀幹與背脊甲
+      px(14, 22 + by, 22, 22, "#881414");
+      px(16, 20 + by, 18, 22, "#e02820");
+      px(12, 18 + by, 4, 4, "#241428");
+      px(11, 24 + by, 4, 4, "#241428");
+      px(11, 30 + by, 4, 4, "#241428");
+      px(12, 36 + by, 4, 3, "#241428");
+
+      // 4. 熔岩鱗甲胸腹
+      px(24, 24 + by, 12, 18, "#c84008");
+      px(26, 25 + by, 9, 15, "#f87818");
+      px(28, 27 + by, 6, 11, "#f8d830");
+      px(27, 29 + by, 7, 1, lavaGlow);
+      px(27, 33 + by, 7, 1, lavaGlow);
+      px(28, 37 + by, 5, 1, lavaGlow);
+
+      // 5. 後腿與利爪
+      px(14, 38, 10, 10, "#881414");
+      px(15, 39, 8, 8, "#e02820");
+      px(14, 47, 12, 3, "#241428");
+      px(24, 48, 3, 2, "#fcfcfc");
+      px(20, 48, 2, 2, "#b8c4d0");
+
+      // 6. 龍頸與龍首
+      px(26, 12 + by, 11, 14, "#e02820");
+      px(28, 14 + by, 8, 11, "#f87818");
+      px(30, 6 + by, 18, 11, "#e02820");
+      px(32, 5 + by, 14, 4, "#881414");
+      px(36, 8 + by, 14, 6, "#e02820");
+      px(48, 8 + by, 2, 2, lavaGlow);
+      px(26, 2 + by, 8, 4, "#241428");
+      px(22, 0 + by, 6, 3, "#4a1c38");
+      px(28, 3 + by, 5, 1, "#f8d830");
+      px(38, 8 + by, 4, 3, "#090a0f");
+      px(39, 8 + by, 3, 2, lavaGlow);
+      px(35, 14 + by, 14, 4, "#241428");
+      px(36, 15 + by, 8, 2, lavaGlow);
+      px(38, 14 + by, 2, 2, "#fcfcfc");
+      px(43, 14 + by, 2, 2, "#fcfcfc");
+      px(47, 14 + by, 2, 2, "#fcfcfc");
+      px(34, 18 + by, 14, 3, "#881414");
+      px(36, 17 + by, 2, 1, "#fcfcfc");
+      px(42, 17 + by, 2, 1, "#fcfcfc");
+
+      // 7. 前翼
+      px(10, 8 - wy, 15, 16, "#4a1c38");
+      px(8, 11 - wy, 14, 14, "#881414");
+      px(11, 13 - wy, 10, 10, "#e02820");
+      px(12, 7 - wy, 14, 2, "#241428");
+      px(24, 6 - wy, 3, 3, "#f8d830");
+      px(10, 12 - wy, 11, 1, lavaGlow);
+      px(9, 16 - wy, 11, 1, "#f87818");
+      px(11, 20 - wy, 9, 1, lavaGlow);
+
+      // 8. 前肢與撕裂利爪
+      px(32, 32 + by, 10, 8, "#e02820");
+      px(38, 36 + by, 7, 6, "#881414");
+      px(44, 37 + by, 4, 2, "#fcfcfc");
+      px(44, 40 + by, 4, 2, "#fcfcfc");
+      px(34, 42, 9, 7, "#e02820");
+      px(36, 48, 10, 2, "#241428");
+      px(45, 48, 3, 2, "#fcfcfc");
+    }
+
+    function drawFFWindow(ctx, x, y, w, h, topCol = "#081868", botCol = "#040828") {
+      ctx.fillStyle = "#040610";
+      ctx.fillRect(x, y, w, h);
+
+      ctx.fillStyle = "#fcfcfc";
+      ctx.fillRect(x + 2, y + 1, w - 4, h - 2);
+      ctx.fillRect(x + 1, y + 2, w - 2, h - 4);
+
+      ctx.fillStyle = "#081030";
+      ctx.fillRect(x + 3, y + 3, w - 6, h - 6);
+
+      const grad = ctx.createLinearGradient(0, y + 4, 0, y + h - 4);
+      grad.addColorStop(0, topCol);
+      grad.addColorStop(1, botCol);
+      ctx.fillStyle = grad;
+      ctx.fillRect(x + 4, y + 4, w - 8, h - 8);
+    }
+
+    function drawText(ctx, str, x, y, color = "#fcfcfc", size = 14, align = "left") {
+      ctx.font = `bold ${size}px "DotGothic16", "Noto Sans TC", monospace`;
+      ctx.textAlign = align;
+      ctx.textBaseline = "top";
+      const ix = Math.floor(x);
+      const iy = Math.floor(y);
+      ctx.fillStyle = "#060812";
+      ctx.fillText(str, ix + 1, iy + 1);
+      ctx.fillText(str, ix + 1, iy);
+      ctx.fillText(str, ix, iy + 1);
+      ctx.fillStyle = color;
+      ctx.fillText(str, ix, iy);
+    }
+
+    /**
+     * ============================================================================
+     * 3. 角色、招式熟練度與戰鬥狀態資料
+     * ============================================================================
+     */
+    const STATE = {
+      SELECT_ACTION: "SELECT_ACTION",
+      ACTION_EXEC: "ACTION_EXEC",
+      DAMAGE_SHOW: "DAMAGE_SHOW",
+      BOSS_DISSOLVE: "BOSS_DISSOLVE",
+      VICTORY_POSE: "VICTORY_POSE",
+      SETTLE_REWARD: "SETTLE_REWARD",
+      SETTLE_LEVELUP: "SETTLE_LEVELUP"
+    };
+
+    function createInitialParty() {
+      const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+      const cloudMaxHp = 1480;
+      const cloudMaxMp = 185;
+      const tifaMaxHp = 1290;
+      const tifaMaxMp = 160;
+      const bmageMaxHp = 1050;
+      const bmageMaxMp = 340;
+
+      return [
+        {
+          id: "cloud",
+          name: "克勞德",
+          lv: 24,
+          nextLv: 25,
+          hp: randInt(1, cloudMaxHp),
+          maxHp: cloudMaxHp,
+          mp: randInt(0, cloudMaxMp),
+          maxMp: cloudMaxMp,
+          limitPct: randInt(0, 100),
+          newMaxHp: 1620,
+          newMaxMp: 204,
+          str: 68,
+          newStr: 73,
+          mag: 42,
+          newMag: 45,
+          expStartPct: 0.72,
+          expEndPct: 0.34,
+          expAnimPct: 0.72,
+          leveledUp: false,
+          defaultSkill: "Blade Burst",
+          limitName: "超究武神霸斬",
+          skillPool: ["Blade Burst", "Triple Slas", "超究武神霸斬"],
+          skillLevels: {
+            "Blade Burst": 2,
+            "Triple Slas": 2,
+            "超究武神霸斬": 1
+          },
+          usedSkill: null,
+          isFinisher: false,
+          x: 492,
+          y: 164,
+          offsetX: 0,
+          offsetY: 0,
+          idleSprite: CLOUD_IDLE,
+          winSprite: CLOUD_WIN
+        },
+        {
+          id: "tifa",
+          name: "蒂法",
+          lv: 22,
+          nextLv: 23,
+          hp: randInt(1, tifaMaxHp),
+          maxHp: tifaMaxHp,
+          mp: randInt(0, tifaMaxMp),
+          maxMp: tifaMaxMp,
+          limitPct: randInt(0, 100),
+          newMaxHp: 1410,
+          newMaxMp: 178,
+          str: 64,
+          newStr: 69,
+          mag: 38,
+          newMag: 41,
+          expStartPct: 0.54,
+          expEndPct: 0.26,
+          expAnimPct: 0.54,
+          leveledUp: false,
+          defaultSkill: "爆裂拳",
+          limitName: "最終天堂",
+          skillPool: ["爆裂拳", "鬥氣幻光球", "最終天堂"],
+          skillLevels: {
+            "爆裂拳": 3,
+            "鬥氣幻光球": 3,
+            "最終天堂": 1
+          },
+          usedSkill: null,
+          isFinisher: false,
+          x: 518,
+          y: 224,
+          offsetX: 0,
+          offsetY: 0,
+          idleSprite: TIFA_IDLE,
+          winSprite: TIFA_WIN
+        },
+        {
+          id: "bmage",
+          name: "黑魔導",
+          lv: 26,
+          nextLv: 27,
+          hp: randInt(1, bmageMaxHp),
+          maxHp: bmageMaxHp,
+          mp: randInt(0, bmageMaxMp),
+          maxMp: bmageMaxMp,
+          limitPct: randInt(0, 100),
+          newMaxHp: 1145,
+          newMaxMp: 378,
+          str: 24,
+          newStr: 26,
+          mag: 86,
+          newMag: 93,
+          expStartPct: 0.85,
+          expEndPct: 0.45,
+          expAnimPct: 0.85,
+          leveledUp: false,
+          defaultSkill: "火焰",
+          limitName: "末日隕石",
+          skillPool: ["火焰", "大雷擊", "大暴雪", "末日隕石"],
+          skillLevels: {
+            "火焰": 1,
+            "大雷擊": 5,
+            "大暴雪": 3,
+            "末日隕石": 2
+          },
+          usedSkill: null,
+          isFinisher: false,
+          x: 544,
+          y: 284,
+          offsetX: 0,
+          offsetY: 0,
+          idleSprite: BMAGE_IDLE,
+          winSprite: BMAGE_WIN
+        }
+      ];
+    }
+
+    const game = {
+      state: STATE.SELECT_ACTION,
+      tick: 0,
+      timer: 0,
+      screenShake: 0,
+      flashAlpha: 0,
+      flashColor: null,
+
+      turnIndex: 0,
+      turnOrder: [0, 2, 1],
+
+      dragon: {
+        name: "煉獄紅蓮龍",
+        alive: true,
+        x: 78,
+        y: 120,
+        flashTimer: 0,
+        dissolve: 0
+      },
+
+      party: createInitialParty(),
+
+      vfx: {
+        type: null,
+        skillName: "",
+        progress: 0,
+        particles: []
+      },
+
+      dmgPopup: {
+        active: false,
+        text: "",
+        subText: "",
+        isCrit: false,
+        x: 165,
+        y: 165,
+        vy: 0,
+        groundY: 185,
+        bounces: 0
+      },
+
+      rewards: {
+        expTarget: 4200,
+        expShown: 0,
+        gilTarget: 6800,
+        gilShown: 0,
+        items: "魔晄結晶 × 1、鳳凰尾巴 × 2",
+        step: 0
+      },
+
+      levelUpStage: 0
+    };
+
+    function getCurrentActor() {
+      const idx = game.turnOrder[game.turnIndex];
+      return game.party[idx];
+    }
+
+    function spawnParticles(count, baseX, baseY, colors, speed = 3) {
+      for (let i = 0; i < count; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const spd = (0.3 + Math.random() * 0.9) * speed;
+        game.vfx.particles.push({
+          x: baseX + (Math.random() - 0.5) * 40,
+          y: baseY + (Math.random() - 0.5) * 40,
+          vx: Math.cos(ang) * spd,
+          vy: Math.sin(ang) * spd - 0.8,
+          size: Math.random() < 0.5 ? 2 : 3,
+          color: colors[Math.floor(Math.random() * colors.length)],
+          life: 24 + Math.floor(Math.random() * 20)
+        });
+      }
+    }
+
+    function resetBattle() {
+      audio.stopVictory();
+
+      game.state = STATE.SELECT_ACTION;
+      game.timer = 0;
+      game.screenShake = 0;
+      game.flashAlpha = 0;
+      game.flashColor = null;
+      game.turnIndex = 0;
+
+      game.dragon.alive = true;
+      game.dragon.flashTimer = 0;
+      game.dragon.dissolve = 0;
+
+      game.party = createInitialParty();
+
+      game.vfx.type = null;
+      game.vfx.skillName = "";
+      game.vfx.progress = 0;
+      game.vfx.particles = [];
+
+      game.dmgPopup.active = false;
+
+      game.rewards.expShown = 0;
+      game.rewards.gilShown = 0;
+      game.rewards.step = 0;
+      game.levelUpStage = 0;
+    }
+
+    /**
+     * ============================================================================
+     * 4. 技能施放與隨機抽選最後一擊邏輯
+     * ============================================================================
+     */
+    function triggerSkill(actor, skillName, isFinisher) {
+      actor.usedSkill = skillName;
+      actor.isFinisher = isFinisher;
+
+      game.state = STATE.ACTION_EXEC;
+      game.timer = 0;
+      game.vfx.skillName = skillName;
+      game.vfx.progress = 0;
+
+      if (skillName === "Blade Burst") {
+        game.vfx.type = "cloud_blade_burst";
+      } else if (skillName === "Triple Slas") {
+        game.vfx.type = "cloud_triple_slash";
+      } else if (skillName === "爆裂拳") {
+        game.vfx.type = "tifa_blast_punch";
+      } else if (skillName === "鬥氣幻光球") {
+        game.vfx.type = "tifa_chi_orb";
+      } else if (skillName === "火焰") {
+        game.vfx.type = "magic_fire";
+      } else if (skillName === "大雷擊") {
+        game.vfx.type = "magic_thunder";
+      } else if (skillName === "大暴雪") {
+        game.vfx.type = "magic_blizzard";
+      } else if (skillName === "末日隕石") {
+        game.vfx.type = "limit_bmage";
+        audio.limitBreak();
+      } else {
+        game.vfx.type = `limit_${actor.id}`;
+        audio.limitBreak();
+      }
+    }
+
+    function triggerRandomFinisher() {
+      const heroIdx = Math.floor(Math.random() * game.party.length);
+      game.turnIndex = game.turnOrder.indexOf(heroIdx);
+      const actor = game.party[heroIdx];
+      const pool = actor.skillPool;
+      const chosenSkill = pool[Math.floor(Math.random() * pool.length)];
+      triggerSkill(actor, chosenSkill, true);
+    }
+
+    // 結算完成後停止勝利音樂並跳轉回前一頁
+    function finishAndGoBack() {
+      audio.stopVictory();
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.location.href = "index.html";
+      }
+    }
+
+    function advanceSettlement() {
+      // 不在這裡重複呼叫 play()，讓已經啟動的 loop 音軌順暢持續播放不中斷
+      if (game.state === STATE.VICTORY_POSE) {
+        audio.cursor();
+        game.state = STATE.SETTLE_REWARD;
+        game.timer = 0;
+      } else if (game.state === STATE.SETTLE_REWARD) {
+        if (game.rewards.step < 2) {
+          game.rewards.step++;
+          game.rewards.expShown = game.rewards.expTarget;
+          if (game.rewards.step >= 1) game.rewards.gilShown = game.rewards.gilTarget;
+          audio.cursor();
+        } else {
+          game.state = STATE.SETTLE_LEVELUP;
+          game.timer = 0;
+          game.levelUpStage = 0;
+        }
+      } else if (game.state === STATE.SETTLE_LEVELUP) {
+        if (game.levelUpStage === 0) {
+          game.party.forEach((h) => {
+            h.expAnimPct = 1 + h.expEndPct;
+            h.leveledUp = true;
+          });
+          game.levelUpStage = 1;
+          audio.levelUp();
+        } else {
+          // 結算畫面點擊到最後時，停止音樂並跳轉回前一頁
+          finishAndGoBack();
+        }
+      }
+    }
+
+    /**
+     * ============================================================================
+     * 5. 鍵盤與滑鼠點擊操作處理
+     * ============================================================================
+     */
+    function handleInput(key) {
+      if (key === "KeyR") {
+        resetBattle();
+        return;
+      }
+
+      if (game.state === STATE.SELECT_ACTION) {
+        audio.init();
+        triggerRandomFinisher();
+      } else if (
+        game.state === STATE.VICTORY_POSE ||
+        game.state === STATE.SETTLE_REWARD ||
+        game.state === STATE.SETTLE_LEVELUP
+      ) {
+        if (key === "Space" || key === "Enter") {
+          advanceSettlement();
+        }
+      }
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (["Space", "Enter", "KeyR"].includes(e.code)) {
+        e.preventDefault();
+        handleInput(e.code);
+      }
+    });
+
+    mainCanvas.addEventListener("click", () => {
+      handleInput("Space");
+    });
+
+    /**
+     * ============================================================================
+     * 6. 每幀狀態更新
+     * ============================================================================
+     */
+    function update() {
+      game.tick++;
+      game.timer++;
+
+      if (game.screenShake > 0) game.screenShake--;
+      if (game.flashAlpha > 0) game.flashAlpha = Math.max(0, game.flashAlpha - 0.05);
+
+      for (let i = game.vfx.particles.length - 1; i >= 0; i--) {
+        const pt = game.vfx.particles[i];
+        pt.x += pt.vx;
+        pt.y += pt.vy;
+        pt.vy += 0.08;
+        pt.life--;
+        if (pt.life <= 0) game.vfx.particles.splice(i, 1);
+      }
+
+      if (game.dragon.flashTimer > 0) game.dragon.flashTimer--;
+
+      switch (game.state) {
+        case STATE.SELECT_ACTION:
+          break;
+
+        case STATE.ACTION_EXEC: {
+          const actor = getCurrentActor();
+          const t = game.timer;
+          const vtype = game.vfx.type;
+          game.vfx.progress = Math.min(1, t / 36);
+
+          // 近戰招式向前衝刺；遠程氣功/魔法小幅踏步蓄力
+          const isMelee =
+            vtype === "cloud_triple_slash" ||
+            vtype === "tifa_blast_punch" ||
+            vtype === "limit_cloud" ||
+            vtype === "limit_tifa";
+
+          if (isMelee) {
+            if (t <= 12) {
+              actor.offsetX = -t * 14;
+            } else if (t >= 34) {
+              actor.offsetX = Math.min(0, actor.offsetX + 18);
+            }
+          } else {
+            if (t <= 10) {
+              actor.offsetX = -t * 3.5;
+            } else if (t >= 34) {
+              actor.offsetX = Math.min(0, actor.offsetX + 5);
+            }
+          }
+
+          // 多段連擊音效與專屬粒子
+          if (vtype === "cloud_triple_slash" && (t === 10 || t === 17 || t === 24)) {
+            audio.swordSlash();
+            spawnParticles(12, 165, 190, ["#fcfcfc", "#78d8ff", "#3898f8"], 3.6);
+          } else if (vtype === "tifa_blast_punch" && (t === 12 || t === 20)) {
+            audio.punchCombo();
+            spawnParticles(14, 168, 192, ["#fcfcfc", "#f87818", "#f8d830"], 3.8);
+          } else if (t === 14) {
+            if (vtype === "cloud_blade_burst") {
+              audio.swordSlash();
+              game.flashColor = "#78d8ff";
+              game.flashAlpha = 0.45;
+              spawnParticles(24, 165, 195, ["#fcfcfc", "#78d8ff", "#3898f8", "#ffea68"], 4.2);
+            } else if (vtype === "tifa_chi_orb") {
+              audio.limitBreak();
+              game.flashColor = "#78d8ff";
+              game.flashAlpha = 0.45;
+              spawnParticles(26, 165, 190, ["#fcfcfc", "#78d8ff", "#ffea68"], 4.0);
+            } else if (vtype === "magic_fire") {
+              audio.fireball();
+              spawnParticles(32, 165, 190, ["#ffea68", "#f87818", "#e02820"], 4.2);
+            } else if (vtype === "magic_thunder") {
+              audio.thunderbolt();
+              game.flashColor = "#fcfcfc";
+              game.flashAlpha = 0.65;
+              spawnParticles(28, 165, 190, ["#fcfcfc", "#f8d830", "#78d8ff"], 4.5);
+            } else if (vtype === "magic_blizzard") {
+              audio.blizzard();
+              game.flashColor = "#78d8ff";
+              game.flashAlpha = 0.5;
+              spawnParticles(34, 165, 190, ["#fcfcfc", "#78d8ff", "#3898f8"], 4.0);
+            } else if (vtype === "limit_bmage") {
+              audio.fireball();
+              game.flashColor = "#f87818";
+              game.flashAlpha = 0.75;
+              spawnParticles(48, 165, 190, ["#fcfcfc", "#ffea68", "#f87818", "#e02820"], 5.6);
+            } else {
+              audio.swordSlash();
+              game.flashColor = "#f8d830";
+              game.flashAlpha = 0.7;
+              spawnParticles(42, 165, 190, ["#fcfcfc", "#ffea68", "#f87818", "#3898f8"], 5.2);
+            }
+          }
+
+          if (t >= 38) {
+            actor.offsetX = 0;
+            audio.criticalFinish();
+            game.state = STATE.DAMAGE_SHOW;
+            game.timer = 0;
+            game.dragon.flashTimer = 18;
+            game.screenShake = 18;
+            game.flashColor = "#fcfcfc";
+            game.flashAlpha = 0.85;
+            game.dmgPopup = {
+              active: true,
+              text: "9999!",
+              subText: "會心一擊！！",
+              isCrit: true,
+              x: 165,
+              y: 155,
+              vy: -3.6,
+              groundY: 182,
+              bounces: 0
+            };
+          }
+          break;
+        }
+
+        case STATE.DAMAGE_SHOW: {
+          const d = game.dmgPopup;
+          if (d.active) {
+            d.y += d.vy;
+            d.vy += 0.22;
+            if (d.y >= d.groundY && d.bounces < 2) {
+              d.y = d.groundY;
+              d.vy = -1.7 / (d.bounces + 1);
+              d.bounces++;
+            } else if (d.y >= d.groundY) {
+              d.y = d.groundY;
+              d.vy = 0;
+            }
+          }
+
+          // 【控制勝利音樂延遲時間】跳出 9999! 後等待 60 幀（1.0 秒）才啟動 ff7_victory.mp3
+          if (game.timer === 60) {
+            audio.startVictoryOnce();
+          }
+
+          if (game.timer >= 68) {
+            d.active = false;
+            game.state = STATE.BOSS_DISSOLVE;
+            game.timer = 0;
+            audio.dragonDefeat();
+            spawnParticles(55, 165, 195, ["#ffea68", "#f87818", "#e02820"], 4.5);
+          }
+          break;
+        }
+
+        case STATE.BOSS_DISSOLVE: {
+          game.dragon.dissolve = Math.min(1, game.timer / 44);
+          if (game.timer % 4 === 0) {
+            spawnParticles(8, 160, 190, ["#ffea68", "#f87818", "#e02820"], 3.2);
+          }
+          if (game.timer >= 48) {
+            game.dragon.alive = false;
+            game.state = STATE.VICTORY_POSE;
+            game.timer = 0;
+          }
+          break;
+        }
+
+        case STATE.VICTORY_POSE:
+          break;
+
+        case STATE.SETTLE_REWARD: {
+          if (game.rewards.step === 0) {
+            if (game.rewards.expShown < game.rewards.expTarget) {
+              game.rewards.expShown = Math.min(game.rewards.expTarget, game.rewards.expShown + 140);
+              if (game.tick % 3 === 0) audio.expTick();
+            }
+          } else if (game.rewards.step === 1) {
+            if (game.rewards.gilShown < game.rewards.gilTarget) {
+              game.rewards.gilShown = Math.min(game.rewards.gilTarget, game.rewards.gilShown + 220);
+              if (game.tick % 3 === 0) audio.expTick();
+            }
+          }
+          break;
+        }
+
+        case STATE.SETTLE_LEVELUP: {
+          if (game.levelUpStage === 0) {
+            let allDone = true;
+            game.party.forEach((h) => {
+              const target = 1 + h.expEndPct;
+              if (h.expAnimPct < target) {
+                h.expAnimPct = Math.min(target, h.expAnimPct + 0.018);
+                allDone = false;
+                if (h.expAnimPct >= 1 && !h.leveledUp) {
+                  h.leveledUp = true;
+                  audio.levelUp();
+                }
+              }
+            });
+            if (allDone) {
+              game.levelUpStage = 1;
+              game.timer = 0;
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    /**
+     * ============================================================================
+     * 7. 戰鬥場景繪製
+     * ============================================================================
+     */
+    function drawBattleBackground(ctx) {
+      const sky = ctx.createLinearGradient(0, 0, 0, 210);
+      sky.addColorStop(0, "#090614");
+      sky.addColorStop(0.55, "#240d1e");
+      sky.addColorStop(1, "#4a1618");
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, LOGICAL_W, 210);
+
+      ctx.fillStyle = "#160a14";
+      ctx.beginPath();
+      ctx.moveTo(0, 210);
+      ctx.lineTo(0, 110);
+      ctx.lineTo(95, 58);
+      ctx.lineTo(185, 125);
+      ctx.lineTo(295, 72);
+      ctx.lineTo(410, 130);
+      ctx.lineTo(540, 68);
+      ctx.lineTo(640, 115);
+      ctx.lineTo(640, 210);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = "#c84008";
+      ctx.fillRect(92, 62, 4, 48);
+      ctx.fillRect(292, 76, 4, 42);
+      ctx.fillRect(537, 72, 4, 45);
+
+      const ground = ctx.createLinearGradient(0, 205, 0, 344);
+      ground.addColorStop(0, "#1c1828");
+      ground.addColorStop(1, "#0d0c16");
+      ctx.fillStyle = ground;
+      ctx.fillRect(0, 205, LOGICAL_W, 140);
+
+      ctx.fillStyle = "#2b243d";
+      for (let row = 0; row < 6; row++) {
+        const gy = 214 + row * 22;
+        const shift = (row % 2) * 36;
+        for (let gx = -36 + shift; gx < LOGICAL_W; gx += 72) {
+          ctx.fillRect(gx, gy, 48, 3);
+        }
+      }
+    }
+
+    function drawSkillVFX(ctx) {
+      if (game.state !== STATE.ACTION_EXEC) return;
+      const p = game.vfx.progress;
+      const vt = game.vfx.type;
+
+      if (vt === "cloud_blade_burst") {
+        // 克勞德 Blade Burst：青金色劍氣波橫掃並爆裂出地裂光柱
+        const waveX = 460 - p * 310;
+        ctx.fillStyle = "#3898f8";
+        ctx.fillRect(waveX - 10, 172, 24, 52);
+        ctx.fillStyle = "#fcfcfc";
+        ctx.fillRect(waveX - 4, 178, 12, 40);
+        if (p > 0.45) {
+          const burstH = Math.sin(((p - 0.45) / 0.55) * Math.PI) * 90;
+          ctx.fillStyle = "#78d8ff";
+          ctx.fillRect(142, 232 - burstH, 16, burstH);
+          ctx.fillRect(172, 232 - burstH * 0.85, 14, burstH * 0.85);
+        }
+      } else if (vt === "cloud_triple_slash") {
+        // 克勞德 Triple Slas：三道交叉銀藍劍光弧
+        const slashes = [
+          [215, 140, 120, 225, 0.15],
+          [125, 145, 215, 225, 0.35],
+          [170, 125, 165, 240, 0.55]
+        ];
+        slashes.forEach(([x1, y1, x2, y2, startP]) => {
+          if (p > startP && p < startP + 0.38) {
+            ctx.strokeStyle = "#3898f8";
+            ctx.lineWidth = 6;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+
+            ctx.strokeStyle = "#fcfcfc";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+        });
+      } else if (vt === "tifa_blast_punch") {
+        // 蒂法 爆裂拳：赤紅烈焰衝擊波與重拳震波環
+        if (p > 0.25) {
+          const r = (p - 0.25) * 72;
+          ctx.strokeStyle = "#f87818";
+          ctx.lineWidth = 5;
+          ctx.beginPath();
+          ctx.arc(170, 195, r, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.fillStyle = "#ffea68";
+          ctx.beginPath();
+          ctx.arc(170, 195, r * 0.45, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (vt === "tifa_chi_orb") {
+        // 蒂法 鬥氣幻光球：三顆螺旋飛馳的青金色氣功光球
+        for (let i = 0; i < 3; i++) {
+          const prog = Math.max(0, Math.min(1, p * 1.35 - i * 0.14));
+          const ox = 485 - prog * 320;
+          const oy = 225 - prog * 32 + Math.sin(prog * 10 + i * 2) * 18;
+          ctx.fillStyle = "#3898f8";
+          ctx.beginPath();
+          ctx.arc(ox, oy, 13, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#fcfcfc";
+          ctx.beginPath();
+          ctx.arc(ox, oy, 7, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (vt === "magic_fire") {
+        // 黑魔導 火焰：熾熱火球爆燃
+        const rad = 14 + Math.sin(p * Math.PI) * 36;
+        ctx.fillStyle = "#e02820";
+        ctx.beginPath();
+        ctx.arc(165, 195, rad, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ffea68";
+        ctx.beginPath();
+        ctx.arc(165, 195, rad * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (vt === "magic_thunder") {
+        // 黑魔導 大雷擊：多道粗獷黃金落雷貫穿頭目
+        if (p > 0.2 && p < 0.88) {
+          const bolts = [148, 172, 192];
+          bolts.forEach((bx, idx) => {
+            if (p > 0.2 + idx * 0.08) {
+              ctx.strokeStyle = idx % 2 === 0 ? "#ffea68" : "#fcfcfc";
+              ctx.lineWidth = 4;
+              ctx.beginPath();
+              ctx.moveTo(bx, 18);
+              ctx.lineTo(bx - 16, 92);
+              ctx.lineTo(bx + 14, 150);
+              ctx.lineTo(bx - 6, 232);
+              ctx.stroke();
+            }
+          });
+        }
+      } else if (vt === "magic_blizzard") {
+        // 黑魔導 大暴雪：暴風雪冰晶柱群落下並結凍
+        ctx.fillStyle = "#78d8ff";
+        for (let i = 0; i < 14; i++) {
+          const ix = 110 + ((i * 19) % 115);
+          const iy = 90 + ((i * 29 + p * 140) % 140);
+          ctx.fillRect(ix, iy, 6, 14);
+          ctx.fillStyle = "#fcfcfc";
+          ctx.fillRect(ix + 2, iy + 2, 2, 10);
+          ctx.fillStyle = "#78d8ff";
+        }
+      } else if (vt === "limit_bmage") {
+        // 黑魔導 末日隕石：巨型燃燒隕石從天而降並引發大爆炸
+        if (p < 0.65) {
+          const mp = p / 0.65;
+          const mx = 280 - mp * 115;
+          const my = 20 + mp * 175;
+          ctx.fillStyle = "#e02820";
+          ctx.beginPath();
+          ctx.arc(mx, my, 24, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#f87818";
+          ctx.beginPath();
+          ctx.arc(mx, my, 16, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#ffea68";
+          ctx.beginPath();
+          ctx.arc(mx, my, 8, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          const ep = (p - 0.65) / 0.35;
+          const rad = 24 + ep * 52;
+          ctx.fillStyle = "#e02820";
+          ctx.beginPath();
+          ctx.arc(165, 195, rad, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#ffea68";
+          ctx.beginPath();
+          ctx.arc(165, 195, rad * 0.6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (vt && vt.startsWith("limit_")) {
+        // 超究武神霸斬 / 最終天堂：連續亂舞閃光斬擊
+        if (p > 0.25 && p < 0.85) {
+          ctx.strokeStyle = "#f8d830";
+          ctx.lineWidth = 5;
+          ctx.beginPath();
+          ctx.moveTo(215, 135);
+          ctx.lineTo(120, 235);
+          ctx.moveTo(125, 140);
+          ctx.lineTo(210, 230);
+          ctx.stroke();
+        }
+      }
+    }
+
+    function drawBattleScreen(ctx) {
+      drawBattleBackground(ctx);
+
+      const dragon = game.dragon;
+
+      // 1. 繪製左側「煉獄紅蓮龍」頭目
+      if (dragon.alive) {
+        const flashWhite = dragon.flashTimer > 0 && Math.floor(dragon.flashTimer / 2) % 2 === 0;
+        drawModernFireDragon(ctx, dragon.x, dragon.y, game.tick, flashWhite, dragon.dissolve);
+      }
+
+      // 2. 繪製右側 FF7 三人組
+      const isVictory = game.state === STATE.VICTORY_POSE;
+      game.party.forEach((hero, idx) => {
+        const winBounce = isVictory ? Math.abs(Math.sin((game.tick + idx * 6) * 0.24)) * -6 : 0;
+        const sprite = isVictory ? hero.winSprite : hero.idleSprite;
+        drawSprite(ctx, sprite, hero.x + hero.offsetX, hero.y + hero.offsetY + winBounce, 2.2, false, 0);
+      });
+
+      // 3. 繪製技能光影與粒子火花
+      drawSkillVFX(ctx);
+      game.vfx.particles.forEach((pt) => {
+        ctx.fillStyle = pt.color;
+        ctx.fillRect(Math.floor(pt.x), Math.floor(pt.y), pt.size, pt.size);
+      });
+
+      // 4. 施展招式頂部名稱橫幅
+      if (game.state === STATE.ACTION_EXEC && game.vfx.skillName) {
+        drawFFWindow(ctx, 210, 14, 220, 32, "#0c2488", "#061040");
+        drawText(ctx, game.vfx.skillName, 320, 22, "#f8d830", 15, "center");
+      }
+
+      // 5. 傷害數字彈跳
+      if (game.dmgPopup.active) {
+        const d = game.dmgPopup;
+        if (d.isCrit) {
+          drawFFWindow(ctx, 200, 14, 240, 34, "#0c2488", "#061040");
+          drawText(ctx, d.subText, 320, 23, "#f8d830", 16, "center");
+        }
+        const numCol = d.isCrit
+          ? Math.floor(game.tick / 3) % 2 === 0
+            ? "#fcfcfc"
+            : "#f8d830"
+          : "#fcfcfc";
+        drawText(ctx, d.text, d.x, d.y, numCol, d.isCrit ? 28 : 20, "center");
+      }
+
+      // 6. 勝利姿態上方提示視窗
+      if (isVictory) {
+        drawFFWindow(ctx, 160, 14, 320, 36, "#0c2488", "#061040");
+        drawText(ctx, "勝利！討伐了煉獄紅蓮龍！", 320, 24, "#fcfcfc", 16, "center");
+        if (Math.floor(game.tick / 16) % 2 === 0) {
+          drawText(ctx, "▼ 按空白鍵或點擊進入結算", 320, 56, "#f8d830", 14, "center");
+        }
+      }
+
+      // 7. 底部 FF7 經典狀態視窗
+      drawFFWindow(ctx, 10, 344, 174, 128);
+      if (dragon.alive) {
+        drawText(ctx, dragon.name, 26, 366, "#fcfcfc", 16);
+        drawText(ctx, "BOSS  ／  炎屬性", 26, 398, "#f89878", 13);
+      } else {
+        drawText(ctx, "敵方全滅", 26, 368, "#94a3b8", 16);
+      }
+
+      drawFFWindow(ctx, 190, 344, 440, 128);
+      game.party.forEach((hero, idx) => {
+        const ry = 358 + idx * 36;
+
+        drawText(ctx, hero.name, 204, ry, "#fcfcfc", 15);
+
+        const hpRatio = hero.hp / hero.maxHp;
+        const hpCol = hpRatio <= 0.25 ? "#f8d830" : "#fcfcfc";
+        drawText(ctx, `HP ${String(hero.hp).padStart(4, " ")}/${hero.maxHp}`, 266, ry, hpCol, 13);
+
+        drawText(ctx, `MP ${String(hero.mp).padStart(3, " ")}/${hero.maxMp}`, 388, ry, "#78d8ff", 13);
+
+        const limX = 496;
+        const limY = ry + 3;
+        const limW = 82;
+        const limH = 10;
+        const isLimitMax = hero.limitPct >= 100;
+
+        ctx.fillStyle = "#060812";
+        ctx.fillRect(limX, limY, limW, limH);
+        ctx.strokeStyle = isLimitMax ? "#f8d830" : "#94a3b8";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(limX, limY, limW, limH);
+
+        const fillW = Math.floor(((limW - 2) * hero.limitPct) / 100);
+        if (isLimitMax) {
+          ctx.fillStyle = Math.floor(game.tick / 4) % 2 === 0 ? "#f84898" : "#f8d830";
+        } else {
+          ctx.fillStyle = "#e85898";
+        }
+        ctx.fillRect(limX + 1, limY + 1, fillW, limH - 2);
+
+        drawText(
+          ctx,
+          isLimitMax ? "MAX" : `${hero.limitPct}%`,
+          limX + limW + 6,
+          ry + 1,
+          isLimitMax ? "#f8d830" : "#f8a8c8",
+          11
+        );
+      });
+    }
+
+    /**
+     * ============================================================================
+     * 8. 戰鬥結算與三人獨立升級、招式熟練度升級明細
+     * ============================================================================
+     */
+    function drawSettlementScreen(ctx) {
+      const bg = ctx.createLinearGradient(0, 0, 0, LOGICAL_H);
+      bg.addColorStop(0, "#040818");
+      bg.addColorStop(1, "#0a1230");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+      drawFFWindow(ctx, 16, 10, 608, 40, "#0c2488", "#061040");
+      drawText(ctx, "★  BATTLE RESULTS  ／  戰 鬥 結 算  ★", 320, 21, "#f8d830", 16, "center");
+
+      if (game.state === STATE.SETTLE_REWARD) {
+        drawFFWindow(ctx, 16, 58, 608, 138);
+
+        drawText(ctx, "獲得經驗值  (EXP)", 40, 76, "#78d8ff", 16);
+        drawText(ctx, `+ ${game.rewards.expShown}`, 596, 76, "#fcfcfc", 18, "right");
+
+        if (game.rewards.step >= 1) {
+          drawText(ctx, "獲得金幣    (GIL)", 40, 112, "#f8d830", 16);
+          drawText(ctx, `+ ${game.rewards.gilShown} GIL`, 596, 112, "#fcfcfc", 18, "right");
+        }
+
+        if (game.rewards.step >= 2) {
+          drawText(ctx, "獲得戰利品  (ITEM)", 40, 148, "#78f898", 16);
+          drawText(ctx, game.rewards.items, 596, 148, "#fcfcfc", 16, "right");
+        }
+
+        drawFFWindow(ctx, 16, 204, 608, 232);
+        game.party.forEach((hero, idx) => {
+          const y = 222 + idx * 68;
+          drawSprite(ctx, hero.winSprite, 36, y - 6, 2.4, false, 0);
+          drawText(ctx, hero.name, 110, y + 8, "#fcfcfc", 16);
+          drawText(ctx, `LV ${hero.lv}`, 214, y + 8, "#78d8ff", 16);
+
+          const actionDesc = hero.usedSkill
+            ? `★ 最後一擊招式：${hero.usedSkill}`
+            : "隊伍支援（共鬥經驗獲得）";
+          drawText(
+            ctx,
+            actionDesc,
+            310,
+            y + 8,
+            hero.usedSkill ? "#f8d830" : "#94a3b8",
+            15
+          );
+        });
+      } else if (game.state === STATE.SETTLE_LEVELUP) {
+        drawFFWindow(ctx, 16, 58, 608, 380);
+
+        game.party.forEach((hero, idx) => {
+          const cardY = 72 + idx * 120;
+
+          if (idx > 0) {
+            ctx.fillStyle = "#243c88";
+            ctx.fillRect(32, cardY - 6, 576, 1);
+          }
+
+          drawSprite(ctx, hero.winSprite, 32, cardY + 8, 2.8, false, 0);
+
+          const curLvDisplay = hero.leveledUp ? hero.nextLv : hero.lv;
+          drawText(ctx, hero.name, 112, cardY + 6, "#fcfcfc", 17);
+          drawText(ctx, `LV ${hero.lv} ──▶ LV ${curLvDisplay}`, 206, cardY + 6, "#78d8ff", 16);
+
+          if (hero.leveledUp) {
+            const flashCol = Math.floor(game.tick / 6) % 2 === 0 ? "#f8d830" : "#fcfcfc";
+            drawText(ctx, "LEVEL UP!!", 488, cardY + 6, flashCol, 16);
+          }
+
+          const barX = 112;
+          const barY = cardY + 34;
+          const barW = 330;
+          const barH = 12;
+
+          ctx.fillStyle = "#060812";
+          ctx.fillRect(barX, barY, barW, barH);
+          ctx.strokeStyle = "#fcfcfc";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(barX, barY, barW, barH);
+
+          const rawPct = hero.expAnimPct;
+          const fillRatio = rawPct >= 1 ? rawPct - 1 : rawPct;
+          ctx.fillStyle = rawPct >= 1 ? "#f8d830" : "#3898f8";
+          ctx.fillRect(barX + 1, barY + 1, Math.floor((barW - 2) * fillRatio), barH - 2);
+
+          const pctLabel = rawPct >= 1
+            ? `NEXT ${Math.floor(fillRatio * 100)}%`
+            : `EXP ${Math.floor(fillRatio * 100)}%`;
+          drawText(ctx, pctLabel, barX + barW + 14, barY - 2, rawPct >= 1 ? "#f8d830" : "#cbd5e1", 14);
+
+          // 第三行：基礎屬性成長 (HP / MP / 力量 / 魔力)
+          const statText = `HP ${hero.maxHp}→${hero.newMaxHp}    MP ${hero.maxMp}→${hero.newMaxMp}    力量 ${hero.str}→${hero.newStr}    魔力 ${hero.mag}→${hero.newMag}`;
+          drawText(ctx, statText, 112, cardY + 56, "#cbd5e1", 13);
+
+          // 第四行：招式熟練度升級（實際出招者顯示所用招式升級，其餘隊友顯示預設招式熟練提升）
+          const activeSkill = hero.usedSkill || hero.defaultSkill;
+          const oldSkillLv = hero.skillLevels[activeSkill] || 1;
+          const newSkillLv = oldSkillLv + 1;
+          const skillUpgradeText = hero.usedSkill
+            ? `★ 招式熟練度提升：${activeSkill} Lv.${oldSkillLv} ──▶ ${activeSkill} Lv.${newSkillLv}`
+            : `☆ 共鬥戰鬥經驗：${activeSkill} Lv.${oldSkillLv} ──▶ ${activeSkill} Lv.${newSkillLv}`;
+          drawText(
+            ctx,
+            skillUpgradeText,
+            112,
+            cardY + 80,
+            hero.leveledUp ? (hero.usedSkill ? "#78f898" : "#78d8ff") : "#94a3b8",
+            15
+          );
+        });
+      }
+
+      // 底部操作提示列
+      if (Math.floor(game.tick / 16) % 2 === 0) {
+        const prompt =
+          game.state === STATE.SETTLE_LEVELUP && game.levelUpStage === 1
+            ? "▶ 按空白鍵或點擊完成結算並返回"
+            : "▼ 按空白鍵或點擊繼續";
+        drawText(ctx, prompt, 320, 450, "#f8d830", 15, "center");
+      }
+    }
+
+    /**
+     * ============================================================================
+     * 9. 主渲染迴圈
+     * ============================================================================
+     */
+    function render() {
+      octx.save();
+
+      if (game.screenShake > 0) {
+        const dx = Math.round((Math.random() - 0.5) * 10);
+        const dy = Math.round((Math.random() - 0.5) * 10);
+        octx.translate(dx, dy);
+      }
+
+      if (game.state === STATE.SETTLE_REWARD || game.state === STATE.SETTLE_LEVELUP) {
+        drawSettlementScreen(octx);
+      } else {
+        drawBattleScreen(octx);
+      }
+
+      if (game.flashAlpha > 0 && game.flashColor) {
+        octx.fillStyle = game.flashColor;
+        octx.globalAlpha = game.flashAlpha;
+        octx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+        octx.globalAlpha = 1;
+      }
+
+      octx.restore();
+
+      mctx.clearRect(0, 0, mainCanvas.width, mainCanvas.height);
+      mctx.drawImage(offCanvas, 0, 0, mainCanvas.width, mainCanvas.height);
+    }
+
+    function loop() {
+      update();
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    window.onload = function () {
+      loop();
+    };
+  </script>
+</body>
+</html>
